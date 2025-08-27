@@ -126,3 +126,99 @@ func DownloadAttachment(c *gin.Context) {
 	}
 	c.File(attachment.ObjectKey)
 }
+
+// ListAttachments —— 列出题目所有附件
+func ListAttachments(c *gin.Context) {
+	challengeID, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		utils.Error(c, 1002, "无效的题目ID")
+		return
+	}
+
+	var attachments []models.Attachment
+	db := database.DB.Where("challenge_id = ?", challengeID)
+
+	// 非管理员用户只能看到 active 状态的附件
+	role, _ := c.Get("user_role")
+	if role != models.RoleAdmin && role != models.RoleRootAdmin {
+		db = db.Where("status = ?", models.AttachmentStatusActive)
+	}
+
+	if err := db.Find(&attachments).Error; err != nil {
+		utils.Error(c, 5000, "查询附件失败: "+err.Error())
+		return
+	}
+
+	utils.Success(c, "success", attachments)
+}
+
+// UpdateAttachmentStatus —— 管理员更新附件状态
+func UpdateAttachmentStatus(c *gin.Context) {
+	attachmentID, err := strconv.Atoi(c.Param("attachment_id"))
+	if err != nil {
+		utils.Error(c, 1002, "无效的附件ID")
+		return
+	}
+
+	var req struct {
+		Status models.AttachmentStatus `json:"status" binding:"required,oneof=pending_scan active quarantined archived"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.Error(c, 1001, "参数无效: "+err.Error())
+		return
+	}
+
+	var attachment models.Attachment
+	if err := database.DB.First(&attachment, attachmentID).Error; err != nil {
+		utils.Error(c, 4004, "附件不存在")
+		return
+	}
+
+	if err := database.DB.Model(&attachment).Update("status", req.Status).Error; err != nil {
+		utils.Error(c, 5000, "更新附件状态失败: "+err.Error())
+		return
+	}
+
+	utils.Success(c, "Attachment status updated successfully", nil)
+}
+
+// DeleteAttachment —— 管理员删除附件
+func DeleteAttachment(c *gin.Context) {
+	attachmentID, err := strconv.Atoi(c.Param("attachment_id"))
+	if err != nil {
+		utils.Error(c, 1002, "无效的附件ID")
+		return
+	}
+
+	var attachment models.Attachment
+	if err := database.DB.First(&attachment, attachmentID).Error; err != nil {
+		// 如果记录不存在，也认为是成功的删除操作
+		utils.Success(c, "Attachment deleted successfully", nil)
+		return
+	}
+
+	// 如果是对象存储（本地文件），则尝试删除本地文件
+	if attachment.Storage == models.StorageObject && attachment.ObjectKey != "" {
+		// 注意：生产环境应增加更严格的路径校验，防止路径遍历
+		_ = os.Remove(attachment.ObjectKey)
+	}
+
+	if err := database.DB.Delete(&attachment).Error; err != nil {
+		utils.Error(c, 5000, "删除附件记录失败: "+err.Error())
+		return
+	}
+
+	utils.Success(c, "Attachment deleted successfully", nil)
+}
+
+// RescanAttachment —— 重新扫描附件（占位符）
+func RescanAttachment(c *gin.Context) {
+	_, err := strconv.Atoi(c.Param("attachment_id"))
+	if err != nil {
+		utils.Error(c, 1002, "无效的附件ID")
+		return
+	}
+
+	// 此处为功能占位，实际应触发异步扫描任务
+	utils.Success(c, "Rescan scheduled", nil)
+}

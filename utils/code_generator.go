@@ -2,6 +2,8 @@
 package utils
 
 import (
+	"fmt"
+	"github.com/google/uuid"
 	"math/rand"
 	"strings"
 	"time"
@@ -19,4 +21,12 @@ func GenerateInvitationCode(length int) string {
 		sb.WriteByte(charset[seededRand.Intn(len(charset))])
 	}
 	return sb.String()
+}
+
+// GenerateDynamicFlag 生成动态 Flag
+func GenerateDynamicFlag() string {
+	part1 := strings.Replace(uuid.New().String(), "-", "", -1)[:12]
+	part2 := strings.Replace(uuid.New().String(), "-", "", -1)[:12]
+	part3 := strings.Replace(uuid.New().String(), "-", "", -1)[:12]
+	return fmt.Sprintf("ISCTF{%s-%s-%s}", part1, part2, part3)
 }

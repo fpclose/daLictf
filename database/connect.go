@@ -45,7 +45,21 @@ func Connect() {
 
 // MigrateTables 函数 (如果你不希望 GORM 自动修改表结构，也应该禁用它)
 func MigrateTables() {
-	err := DB.AutoMigrate(&models.School{}, &models.User{})
+	err := DB.AutoMigrate(
+		&models.School{},
+		&models.User{},
+		&models.Team{},
+		&models.TeamMember{},
+		&models.QuestionType{},
+		&models.Challenge{},
+		&models.Attachment{},
+		&models.Submission{},
+		&models.Scoreboard{},
+		&models.SolveFeed{},
+		&models.Contest{},
+		&models.ContestSchool{},
+		&models.ContestSponsor{},
+	)
 	if err != nil {
 		log.Fatal("Failed to migrate database:", err)
 	}

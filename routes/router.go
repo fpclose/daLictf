@@ -5,7 +5,6 @@ import (
 	"ISCTF/controllers"
 	"ISCTF/middlewares"
 	"ISCTF/models"
-
 	"github.com/gin-gonic/gin"
 )
 
@@ -15,196 +14,140 @@ func SetupRouter() *gin.Engine {
 	apiV1 := r.Group("/api/v1")
 	{
 		// =======================
-		// 用户模块
+		// 公开模块
 		// =======================
+		// 用户公开接口
 		usersPublic := apiV1.Group("/users")
 		{
 			usersPublic.POST("/register", controllers.Register)
 			usersPublic.POST("/login", controllers.Login)
 		}
-		usersAuth := apiV1.Group("/users")
-		usersAuth.Use(middlewares.JWTAuthMiddleware())
+		// 比赛大屏
+		scoreboardRoutes := apiV1.Group("/scoreboard")
 		{
-			usersAuth.GET("/:id", controllers.GetUserDetail)
-			usersAuth.PUT("/:id", controllers.UpdateUser)
+			scoreboardRoutes.GET("", controllers.GetScoreboard)
+			scoreboardRoutes.GET("/feed", controllers.GetSolveFeed)
 		}
-
-		// 管理员 - 用户管理
-		adminUsers := apiV1.Group("/admin")
-		adminUsers.Use(
-			middlewares.JWTAuthMiddleware(),
-			middlewares.RoleAuthMiddleware(models.RoleAdmin),
-		)
+		// 比赛基础信息
+		contestRoutes := apiV1.Group("/contest")
 		{
-			adminUsers.GET("/users", controllers.GetUserList)
-			adminUsers.DELETE("/users/:id", controllers.DeleteUser)
-			adminUsers.PUT("/users/:id/status", controllers.UpdateUserStatus)
-
-			// 仅 root_admin 可改角色
-			adminUsers.PUT(
-				"/users/:id/role",
-				middlewares.RoleAuthMiddleware(models.RoleRootAdmin),
-				controllers.UpdateUserRole,
-			)
+			contestRoutes.GET("/current", controllers.GetCurrentContest)
+			contestRoutes.GET("/status", controllers.GetContestStatus)
 		}
+		// 学校列表
+		apiV1.GET("/schools", controllers.GetSchoolList)
+		apiV1.GET("/schools/:id", middlewares.JWTTryAuthMiddleware(), controllers.GetSchoolDetail)
+		// 题目类型列表
+		apiV1.GET("/question-types", controllers.GetQuestionTypeList)
+		apiV1.GET("/question-types/:id", controllers.GetQuestionTypeDetail)
 
 		// =======================
-		// 学校模块
+		// 需登录模块
 		// =======================
-		schoolRoutes := apiV1.Group("/schools")
+		authRequired := apiV1.Group("/")
+		authRequired.Use(middlewares.JWTAuthMiddleware())
 		{
-			schoolRoutes.GET("", controllers.GetSchoolList)
+			// 用户
+			usersAuth := authRequired.Group("/users")
+			{
+				usersAuth.GET("/:id", controllers.GetUserDetail)
+				usersAuth.PUT("/:id", controllers.UpdateUser)
+			}
 
-			// 允许“尝试认证”查看（已登录可带更多信息）
-			schoolRoutes.GET("/:id",
-				middlewares.JWTTryAuthMiddleware(),
-				controllers.GetSchoolDetail,
-			)
+			// 队伍
+			teamRoutes := authRequired.Group("/teams")
+			{
+				teamRoutes.POST("", controllers.CreateTeam)
+				teamRoutes.POST("/join", controllers.JoinTeam)
+				teamRoutes.POST("/leave", controllers.LeaveTeam)
+				teamRoutes.DELETE("/:id", controllers.DisbandTeam)
+				teamRoutes.DELETE("/:id/members/:user_id", controllers.KickMember)
+				teamRoutes.PUT("/:id", controllers.UpdateTeam)
+				teamRoutes.GET("/:id/solves", controllers.GetTeamSolves)
+			}
 
-			// 管理员
-			schoolRoutes.POST("",
-				middlewares.JWTAuthMiddleware(),
-				middlewares.RoleAuthMiddleware(models.RoleAdmin),
-				controllers.CreateSchool,
-			)
-			schoolRoutes.PUT("/:id",
-				middlewares.JWTAuthMiddleware(),
-				middlewares.RoleAuthMiddleware(models.RoleAdmin),
-				controllers.UpdateSchool,
-			)
-			schoolRoutes.DELETE("/:id",
-				middlewares.JWTAuthMiddleware(),
-				middlewares.RoleAuthMiddleware(models.RoleAdmin),
-				controllers.DeleteSchool,
-			)
-			schoolRoutes.PUT("/:id/status",
-				middlewares.JWTAuthMiddleware(),
-				middlewares.RoleAuthMiddleware(models.RoleAdmin),
-				controllers.UpdateSchoolStatus,
-			)
-			schoolRoutes.POST("/:id/reset-invitation-code",
-				middlewares.JWTAuthMiddleware(),
-				middlewares.RoleAuthMiddleware(models.RoleAdmin),
-				controllers.ResetInvitationCode,
-			)
-		}
+			// 题目
+			challengeRoutes := authRequired.Group("/challenges")
+			{
+				challengeRoutes.GET("", controllers.ListChallenges)
+				challengeRoutes.GET("/:id", controllers.GetChallengeDetail)
+				challengeRoutes.POST("/:id/submit", controllers.SubmitFlag)
+				challengeRoutes.GET("/:id/attachments", controllers.ListAttachments)
+			}
 
-		// =======================
-		// 队伍模块
-		// =======================
-		teamRoutes := apiV1.Group("/teams")
-		teamRoutes.Use(middlewares.JWTAuthMiddleware())
-		{
-			teamRoutes.POST("", controllers.CreateTeam)
-			teamRoutes.POST("/join", controllers.JoinTeam)
-			teamRoutes.POST("/leave", controllers.LeaveTeam)
-			teamRoutes.DELETE("/:id", controllers.DisbandTeam)
-			teamRoutes.DELETE("/:id/members/:user_id", controllers.KickMember)
-			teamRoutes.PUT("/:id", controllers.UpdateTeam)
-		}
+			// 附件下载
+			attachmentRoutes := authRequired.Group("/attachments")
+			{
+				attachmentRoutes.GET("/:attachment_id/download", controllers.DownloadAttachment)
+			}
 
-		// 管理员 - 队伍管理
-		adminTeamRoutes := apiV1.Group("/admin/teams")
-		adminTeamRoutes.Use(
-			middlewares.JWTAuthMiddleware(),
-			middlewares.RoleAuthMiddleware(models.RoleAdmin),
-		)
-		{
-			adminTeamRoutes.GET("", controllers.AdminGetTeams)
-			adminTeamRoutes.PUT("/:id/status", controllers.AdminUpdateTeamStatus)
-			adminTeamRoutes.DELETE("/:id", controllers.AdminDeleteTeam)
+			// 动态容器
+			containerRoutes := authRequired.Group("/containers")
+			{
+				containerRoutes.POST("", controllers.CreateContainer)
+				containerRoutes.GET("", controllers.ListContainers)
+				containerRoutes.PUT("/:id/renew", controllers.RenewContainer)
+				containerRoutes.DELETE("/:id", controllers.DestroyContainer)
+			}
 		}
 
 		// =======================
-		// 题目类型模块
+		// 管理员模块
 		// =======================
-		qtRoutes := apiV1.Group("/question-types")
+		adminAPIs := apiV1.Group("/admin")
+		adminAPIs.Use(middlewares.JWTAuthMiddleware(), middlewares.RoleAuthMiddleware(models.RoleAdmin))
 		{
-			// 公开
-			qtRoutes.GET("", controllers.GetQuestionTypeList)
-			qtRoutes.GET("/:id", controllers.GetQuestionTypeDetail)
+			// 用户管理
+			adminAPIs.GET("/users", controllers.GetUserList)
+			adminAPIs.DELETE("/users/:id", controllers.DeleteUser)
+			adminAPIs.PUT("/users/:id/status", controllers.UpdateUserStatus)
+			adminAPIs.PUT("/users/:id/role", middlewares.RoleAuthMiddleware(models.RoleRootAdmin), controllers.UpdateUserRole)
 
-			// 管理员
-			qtRoutes.POST("",
-				middlewares.JWTAuthMiddleware(),
-				middlewares.RoleAuthMiddleware(models.RoleAdmin),
-				controllers.CreateQuestionType,
-			)
-			qtRoutes.PUT("/:id",
-				middlewares.JWTAuthMiddleware(),
-				middlewares.RoleAuthMiddleware(models.RoleAdmin),
-				controllers.UpdateQuestionType,
-			)
-			qtRoutes.DELETE("/:id",
-				middlewares.JWTAuthMiddleware(),
-				middlewares.RoleAuthMiddleware(models.RoleAdmin),
-				controllers.DeleteQuestionType,
-			)
-		}
+			// 学校管理
+			adminAPIs.POST("/schools", controllers.CreateSchool)
+			adminAPIs.PUT("/schools/:id", controllers.UpdateSchool)
+			adminAPIs.DELETE("/schools/:id", controllers.DeleteSchool)
+			adminAPIs.PUT("/schools/:id/status", controllers.UpdateSchoolStatus)
+			adminAPIs.POST("/schools/:id/reset-invitation-code", controllers.ResetInvitationCode)
 
-		// =======================
-		// 题目模块
-		// =======================
-		challengeRoutes := apiV1.Group("/challenges")
-		{
-			// 用户侧（需要登录；仅返回 state=visible）
-			challengeRoutes.GET("",
-				middlewares.JWTAuthMiddleware(),
-				controllers.ListChallenges,
-			)
-			challengeRoutes.GET("/:id",
-				middlewares.JWTAuthMiddleware(),
-				controllers.GetChallengeDetail,
-			)
-			challengeRoutes.POST("/:id/submit",
-				middlewares.JWTAuthMiddleware(),
-				controllers.SubmitFlag,
-			)
+			// 队伍管理
+			adminAPIs.GET("/teams", controllers.AdminGetTeams)
+			adminAPIs.PUT("/teams/:id/status", controllers.AdminUpdateTeamStatus)
+			adminAPIs.DELETE("/teams/:id", controllers.AdminDeleteTeam)
 
-			// 管理员创建题目
-			challengeRoutes.POST("",
-				middlewares.JWTAuthMiddleware(),
-				middlewares.RoleAuthMiddleware(models.RoleAdmin),
-				controllers.CreateChallenge,
-			)
+			// 题目类型管理
+			adminAPIs.POST("/question-types", controllers.CreateQuestionType)
+			adminAPIs.PUT("/question-types/:id", controllers.UpdateQuestionType)
+			adminAPIs.DELETE("/question-types/:id", controllers.DeleteQuestionType)
 
-			// 附件（外链 JSON & multipart 上传）
-			challengeRoutes.POST("/:id/attachments",
-				middlewares.JWTAuthMiddleware(),
-				middlewares.RoleAuthMiddleware(models.RoleAdmin),
-				controllers.AddAttachment,
-			)
+			// 题目管理
+			adminAPIs.POST("/challenges", controllers.CreateChallenge)
+			adminAPIs.PUT("/challenges/:id", controllers.UpdateChallenge)
+			adminAPIs.DELETE("/challenges/:id", controllers.DeleteChallenge)
+			adminAPIs.GET("/challenges", controllers.AdminListChallenges)
+			adminAPIs.GET("/challenges/:id", controllers.AdminGetChallengeDetail)
 
-			// TODO（如有需要）：后续补充管理员更新/删除题目
-			// challengeRoutes.PUT("/:id",    middlewares.JWTAuthMiddleware(), middlewares.RoleAuthMiddleware(models.RoleAdmin), controllers.UpdateChallenge)
-			// challengeRoutes.DELETE("/:id", middlewares.JWTAuthMiddleware(), middlewares.RoleAuthMiddleware(models.RoleAdmin), controllers.DeleteChallenge)
-		}
+			// 附件管理
+			adminAPIs.POST("/challenges/:id/attachments", controllers.AddAttachment)
+			adminAPIs.PUT("/attachments/:attachment_id", controllers.UpdateAttachmentStatus)
+			adminAPIs.DELETE("/attachments/:attachment_id", controllers.DeleteAttachment)
+			adminAPIs.POST("/attachments/:attachment_id/rescan", controllers.RescanAttachment)
 
-		// 管理员 - 题目管理（不受可见性限制）
-		adminChal := apiV1.Group("/admin/challenges")
-		adminChal.Use(
-			middlewares.JWTAuthMiddleware(),
-			middlewares.RoleAuthMiddleware(models.RoleAdmin),
-		)
-		{
-			// 新增：管理员题目列表 & 详情
-			adminChal.GET("", controllers.AdminListChallenges)
-			adminChal.GET("/:id", controllers.AdminGetChallengeDetail)
+			// 动态容器管理
+			adminAPIs.GET("/containers/:id/pcap", controllers.GetPcapLog)
+			adminAPIs.DELETE("/containers/:id", controllers.AdminDestroyContainer)
 
-			// 可选：管理员置显/置隐
-			// 仅当你实现了 AdminUpdateChallengeState 时再放开
-			//adminChal.PUT("/:id/state", controllers.AdminUpdateChallengeState)
-		}
+			// Flag 审计
+			adminAPIs.GET("/flags/logs", controllers.GetFlagLogs)
+			adminAPIs.PUT("/flags/:id/suspect", controllers.MarkSuspectSubmission)
+			adminAPIs.GET("/flags/compare", controllers.CompareFlagSubmissions)
 
-		// =======================
-		// 附件下载统一网关（需登录）
-		// =======================
-		attachmentRoutes := apiV1.Group("/attachments")
-		{
-			attachmentRoutes.GET("/:attachment_id/download",
-				middlewares.JWTAuthMiddleware(),
-				controllers.DownloadAttachment,
-			)
+			// 比赛信息管理
+			adminAPIs.POST("/contest", controllers.UpsertContest)
+			adminAPIs.POST("/contest/schools", controllers.AddContestSchool)
+			adminAPIs.DELETE("/contest/schools/:id", controllers.DeleteContestSchool)
+			adminAPIs.POST("/contest/sponsors", controllers.AddContestSponsor)
+			adminAPIs.DELETE("/contest/sponsors/:id", controllers.DeleteContestSponsor)
 		}
 	}
 

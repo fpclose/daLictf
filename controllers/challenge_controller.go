@@ -5,11 +5,13 @@ import (
 	"ISCTF/database"
 	"ISCTF/dto"
 	"ISCTF/models"
+	"ISCTF/services"
 	"ISCTF/utils"
 	"errors"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+	"log"
 	"math"
 	"strconv"
 	"strings"
@@ -22,9 +24,8 @@ func CreateChallenge(c *gin.Context) {
 		utils.Error(c, 1001, "参数无效: "+err.Error())
 		return
 	}
-	req.Normalize() // 兼容 camelCase / snake_case
+	req.Normalize()
 
-	// 必填校验（统一在这里做，避免绑定阶段因别名导致的校验失败）
 	if req.ChallengeName == "" || req.ChallengeTypeID == 0 || req.Author == "" ||
 		req.Description == "" || req.Mode == "" || req.InitialScore == 0 {
 		utils.Error(c, 1001, "缺少必填字段")
@@ -51,14 +52,12 @@ func CreateChallenge(c *gin.Context) {
 		return
 	}
 
-	// 题目类型存在性校验
 	var qt models.QuestionType
 	if err := database.DB.First(&qt, req.ChallengeTypeID).Error; err != nil {
 		utils.Error(c, 4001, "题目类型不存在")
 		return
 	}
 
-	// 手动映射到模型
 	chal := models.Challenge{
 		ChallengeName:   req.ChallengeName,
 		ChallengeTypeID: req.ChallengeTypeID,
@@ -72,7 +71,7 @@ func CreateChallenge(c *gin.Context) {
 		Difficulty:      models.ChallengeDifficulty(req.Difficulty),
 		InitialScore:    req.InitialScore,
 		MinScore:        req.MinScore,
-		CurrentScore:    req.InitialScore, // 初始化为初始分
+		CurrentScore:    req.InitialScore,
 		DecayRatio:      req.DecayRatio,
 	}
 
@@ -89,8 +88,6 @@ func ListChallenges(c *gin.Context) {
 	db := database.DB.Model(&models.Challenge{}).
 		Where("state = ?", models.ChallengeStateVisible).
 		Preload("QuestionType")
-
-	// TODO: 可在此读取 query 参数增加筛选
 
 	if err := db.Find(&challenges).Error; err != nil {
 		utils.Error(c, 5000, "查询失败")
@@ -165,7 +162,7 @@ func GetChallengeDetail(c *gin.Context) {
 	utils.Success(c, "success", resp)
 }
 
-// SubmitFlag —— 提交 Flag 并处理分数衰减、队伍判重等
+// SubmitFlag -- 包含完整日志、计分、销毁容器和自动标记逻辑
 func SubmitFlag(c *gin.Context) {
 	challengeID, _ := strconv.Atoi(c.Param("id"))
 
@@ -176,53 +173,83 @@ func SubmitFlag(c *gin.Context) {
 	}
 	req.Normalize()
 
-	// 从中间件读取用户信息
-	userIDAny, exists := c.Get("user_id")
-	if !exists {
-		utils.Error(c, 4001, "未登录")
-		return
-	}
+	userIDAny, _ := c.Get("user_id")
 	userID := userIDAny.(uint32)
 
+	var userTeam models.TeamMember
+	if err := database.DB.Where("user_id = ?", userID).First(&userTeam).Error; err != nil {
+		utils.Error(c, 3005, "你尚未加入任何队伍")
+		return
+	}
+
+	var team models.Team
+	database.DB.First(&team, userTeam.TeamID)
+	if team.TeamStatus == models.TeamStatusBanned {
+		utils.Error(c, 4003, "队伍已被封禁，无法提交 Flag")
+		return
+	}
+
+	var challenge models.Challenge
+	if err := database.DB.First(&challenge, challengeID).Error; err != nil {
+		utils.Error(c, 4004, "题目不存在")
+		return
+	}
+
+	logEntry := models.SubmissionLog{
+		ChallengeID:   uint32(challengeID),
+		TeamID:        userTeam.TeamID,
+		UserID:        userID,
+		SubmittedFlag: req.Flag,
+		IPAddress:     c.ClientIP(),
+	}
+
+	isCorrect := false
+	var dynamicContainer models.Container
+	if challenge.Mode == models.ChallengeModeStatic {
+		isCorrect = (challenge.StaticFlag == req.Flag)
+	} else {
+		err := database.DB.Where("challenge_id = ? AND team_id = ?", challengeID, userTeam.TeamID).First(&dynamicContainer).Error
+		if err == nil && dynamicContainer.ContainerFlag == req.Flag {
+			isCorrect = true
+		}
+	}
+
 	err := database.DB.Transaction(func(tx *gorm.DB) error {
-		// 必须加入队伍
-		var userTeam models.TeamMember
-		if err := tx.Where("user_id = ?", userID).First(&userTeam).Error; err != nil {
-			return errors.New("你尚未加入队伍")
+		var existingSolve models.Submission
+		if err := tx.Where("challenge_id = ? AND team_id = ?", challengeID, userTeam.TeamID).First(&existingSolve).Error; err == nil {
+			logEntry.FlagResult = models.FlagResultDuplicate
+			tx.Create(&logEntry)
+			utils.Error(c, 6001, "Already solved by your team")
+			return errors.New("duplicate solve")
 		}
 
-		// 对题目行加锁，避免并发更新
-		var challenge models.Challenge
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-			First(&challenge, challengeID).Error; err != nil {
-			return errors.New("题目不存在")
+		if !isCorrect {
+			logEntry.FlagResult = models.FlagResultWrong
+			tx.Create(&logEntry)
+			utils.Error(c, 6002, "Incorrect flag")
+			return errors.New("incorrect flag")
 		}
 
-		// 同队伍重复解题判定
-		var existingSubmission models.Submission
-		tx.Where("challenge_id = ? AND team_id = ?", challengeID, userTeam.TeamID).
-			First(&existingSubmission)
-		if existingSubmission.ID != 0 {
-			return errors.New("你所在的队伍已解出此题")
-		}
-
-		// 静态题校验 Flag（动态题另行实现）
-		if challenge.Mode != models.ChallengeModeStatic || challenge.StaticFlag != req.Flag {
-			return errors.New("Flag 错误")
-		}
-
-		// 写入提交记录
-		submission := models.Submission{
-			ChallengeID: uint32(challengeID),
-			UserID:      userID,
-			TeamID:      userTeam.TeamID,
-			IsCorrect:   true,
-		}
-		if err := tx.Create(&submission).Error; err != nil {
+		logEntry.FlagResult = models.FlagResultCorrect
+		if err := tx.Create(&logEntry).Error; err != nil {
 			return err
 		}
 
-		// 分数衰减：每解出一次衰减 initial_score * decay_ratio（至少 1 分）
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&challenge, challengeID).Error; err != nil {
+			return err
+		}
+
+		scoreToAward := challenge.CurrentScore
+		newSolve := models.Submission{
+			ChallengeID: uint32(challengeID),
+			TeamID:      userTeam.TeamID,
+			UserID:      userID,
+			Score:       scoreToAward,
+		}
+		if err := tx.Create(&newSolve).Error; err != nil {
+			return err
+		}
+
 		challenge.SolvedCount++
 		decay := uint(math.Round(float64(challenge.InitialScore) * float64(challenge.DecayRatio)))
 		if decay == 0 && challenge.DecayRatio > 0 {
@@ -234,25 +261,133 @@ func SubmitFlag(c *gin.Context) {
 		}
 		challenge.CurrentScore = uint(newScore)
 
-		return tx.Save(&challenge).Error
+		if err := tx.Save(&challenge).Error; err != nil {
+			return err
+		}
+
+		if isCorrect && challenge.Mode == models.ChallengeModeDynamic && dynamicContainer.ID != 0 {
+			go func() {
+				err := services.DestroyContainer(dynamicContainer.DockerID)
+				if err != nil {
+					log.Printf("Error destroying container %s after solve: %v", dynamicContainer.DockerID, err)
+					return
+				}
+				dynamicContainer.State = models.ContainerStateDestroyed
+				database.DB.Save(&dynamicContainer)
+				log.Printf("Container %s destroyed successfully after correct submission.", dynamicContainer.DockerID)
+			}()
+		}
+
+		if challenge.Mode == models.ChallengeModeDynamic {
+			go func(flag string, currentTeamID uint32) {
+				var otherSubmissions []models.SubmissionLog
+				database.DB.Where("submitted_flag = ? AND team_id != ? AND flag_result = ?", flag, currentTeamID, models.FlagResultCorrect).Find(&otherSubmissions)
+				if len(otherSubmissions) > 0 {
+					database.DB.Model(&models.SubmissionLog{}).Where("submitted_flag = ? AND flag_result = ?", flag, models.FlagResultCorrect).Update("suspected", true)
+					log.Printf("Suspicious activity detected: Dynamic flag '%s' submitted by multiple teams. All related submissions have been marked.", flag)
+				}
+			}(req.Flag, team.ID)
+		}
+
+		// 新增：触发大屏缓存更新
+		go func(solve models.Submission, chal models.Challenge, t models.Team) {
+			services.AddSolveToFeed(solve, chal, t)
+			services.UpdateScoreboardCache() // 每次解题都完全刷新排行榜
+		}(newSolve, challenge, team)
+
+		utils.Success(c, "Correct! First solve for your team.", gin.H{
+			"challenge_id": challenge.ID,
+			"score":        scoreToAward,
+			"team_id":      team.ID,
+			"solving_time": newSolve.SolvingTime,
+		})
+		return nil
 	})
 
+	if err != nil && (err.Error() == "duplicate solve" || err.Error() == "incorrect flag") {
+		return
+	}
+}
+
+// UpdateChallenge —— 管理员修改题目
+func UpdateChallenge(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
-		utils.Error(c, 5001, err.Error())
+		utils.Error(c, 1002, "无效的题目ID")
 		return
 	}
 
-	utils.Success(c, "Flag 正确！", gin.H{})
+	var req dto.UpdateChallengeReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.Error(c, 1001, "参数无效: "+err.Error())
+		return
+	}
+
+	var challenge models.Challenge
+	if err := database.DB.First(&challenge, id).Error; err != nil {
+		utils.Error(c, 4004, "题目不存在")
+		return
+	}
+
+	updates := make(map[string]interface{})
+	if req.State != nil {
+		updates["state"] = models.ChallengeState(*req.State)
+	}
+	if req.Hint != nil {
+		updates["hint"] = *req.Hint
+	}
+	if req.Difficulty != nil {
+		updates["difficulty"] = models.ChallengeDifficulty(*req.Difficulty)
+	}
+	if req.Mode != nil {
+		updates["mode"] = models.ChallengeMode(*req.Mode)
+	}
+	if req.StaticFlag != nil {
+		updates["static_flag"] = *req.StaticFlag
+	}
+	if req.DockerImage != nil {
+		updates["docker_image"] = *req.DockerImage
+	}
+	if req.DockerPorts != nil {
+		updates["docker_ports"] = *req.DockerPorts
+	}
+
+	if len(updates) == 0 {
+		utils.Success(c, "没有需要更新的字段", nil)
+		return
+	}
+
+	if err := database.DB.Model(&challenge).Updates(updates).Error; err != nil {
+		utils.Error(c, 5000, "更新题目失败: "+err.Error())
+		return
+	}
+
+	utils.Success(c, "Challenge updated successfully", nil)
 }
 
-// AdminListChallenges —— 管理员查询题目列表（可见/隐藏均可，支持筛选+分页）
+// DeleteChallenge —— 管理员删除题目
+func DeleteChallenge(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		utils.Error(c, 1002, "无效的题目ID")
+		return
+	}
+
+	if err := database.DB.Delete(&models.Challenge{}, id).Error; err != nil {
+		utils.Error(c, 5000, "删除题目失败: "+err.Error())
+		return
+	}
+
+	utils.Success(c, "Challenge deleted successfully", nil)
+}
+
+// AdminListChallenges —— 管理员查询题目列表
 func AdminListChallenges(c *gin.Context) {
-	// 读取筛选参数
 	typeIDStr := c.Query("type_id")
-	mode := strings.TrimSpace(c.Query("mode"))       // static/dynamic
-	diff := strings.TrimSpace(c.Query("difficulty")) // easy/medium/hard
-	state := strings.TrimSpace(c.Query("state"))     // visible/hidden
-	kw := strings.TrimSpace(c.Query("keyword"))      // 模糊匹配 name/description
+	mode := strings.TrimSpace(c.Query("mode"))
+	diff := strings.TrimSpace(c.Query("difficulty"))
+	state := strings.TrimSpace(c.Query("state"))
+	kw := strings.TrimSpace(c.Query("keyword"))
 	pageStr := c.DefaultQuery("page", "1")
 	limitStr := c.DefaultQuery("limit", "10")
 
@@ -322,7 +457,7 @@ func AdminListChallenges(c *gin.Context) {
 	})
 }
 
-// AdminGetChallengeDetail —— 管理员查询题目详情（不受可见性限制，附件返回所有状态）
+// AdminGetChallengeDetail —— 管理员查询题目详情
 func AdminGetChallengeDetail(c *gin.Context) {
 	id, _ := strconv.Atoi(c.Param("id"))
 
