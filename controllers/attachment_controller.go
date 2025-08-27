@@ -3,6 +3,7 @@ package controllers
 
 import (
 	"ISCTF/database"
+	"ISCTF/dto"
 	"ISCTF/models"
 	"ISCTF/utils"
 	"crypto/sha256"
@@ -12,29 +13,29 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
+// AddAttachment —— 支持 JSON 外链 & multipart 上传，使用 DTO 绑定
 func AddAttachment(c *gin.Context) {
 	challengeID, _ := strconv.Atoi(c.Param("id"))
 
-	// =======================================================
-	//  ↓↓↓ 修正点：使用兼容旧版Gin的写法 ↓↓↓
-	// =======================================================
-	userIDAny, _ := c.Get("user_id")
+	// 从中间件获取用户 ID
+	userIDAny, ok := c.Get("user_id")
+	if !ok {
+		utils.Error(c, 4001, "未登录")
+		return
+	}
 	userID := userIDAny.(uint32)
-	// =======================================================
 
 	contentType := c.ContentType()
-
 	var newAttachment models.Attachment
 	newAttachment.ChallengeID = uint32(challengeID)
 	newAttachment.CreatedBy = userID
 
 	if contentType == "application/json" {
-		var req struct {
-			URL      string `json:"url" binding:"required,url"`
-			FileName string `json:"file_name" binding:"required"`
-		}
+		// 外链方式
+		var req dto.AddAttachmentURLReq
 		if err := c.ShouldBindJSON(&req); err != nil {
 			utils.Error(c, 1001, "参数无效")
 			return
@@ -43,26 +44,35 @@ func AddAttachment(c *gin.Context) {
 		newAttachment.URL = req.URL
 		newAttachment.FileName = req.FileName
 		newAttachment.SHA256 = "URL_NOT_HASHED"
-		// =======================================================
-		//  ↓↓↓ 修正点：使用带前缀的新常量 ↓↓↓
-		// =======================================================
-		newAttachment.Status = models.AttachmentStatusActive
-		// =======================================================
-	} else if c.Request.Header.Get("Content-Type")[0:19] == "multipart/form-data" { // 更稳健地判断
+		newAttachment.Status = models.AttachmentStatusActive // 外链直接激活（若需风控可改为 pending_scan）
+
+	} else if strings.HasPrefix(contentType, "multipart/") {
+		// 平台上传方式
 		file, err := c.FormFile("file")
 		if err != nil {
 			utils.Error(c, 1001, "获取文件失败")
 			return
 		}
 
+		// 保存到本地（示例路径：./uploads）
+		if err := os.MkdirAll("./uploads", 0o755); err != nil {
+			utils.Error(c, 5000, "创建上传目录失败")
+			return
+		}
 		dst := filepath.Join("./uploads", file.Filename)
 		if err := c.SaveUploadedFile(file, dst); err != nil {
 			utils.Error(c, 5000, "保存文件失败")
 			return
 		}
 
-		f, _ := os.Open(dst)
+		// 计算 SHA256
+		f, err := os.Open(dst)
+		if err != nil {
+			utils.Error(c, 5000, "打开文件失败")
+			return
+		}
 		defer f.Close()
+
 		hasher := sha256.New()
 		if _, err := io.Copy(hasher, f); err != nil {
 			utils.Error(c, 5000, "计算哈希失败")
@@ -70,11 +80,14 @@ func AddAttachment(c *gin.Context) {
 		}
 
 		newAttachment.Storage = models.StorageObject
-		newAttachment.ObjectKey = dst
+		newAttachment.ObjectBucket = "" // 如使用对象存储可设置真实桶名
+		newAttachment.ObjectKey = dst   // 示例：本地文件路径
 		newAttachment.FileName = file.Filename
-		newAttachment.FileSize = uint64(file.Size)
 		newAttachment.ContentType = file.Header.Get("Content-Type")
+		newAttachment.FileSize = uint64(file.Size)
 		newAttachment.SHA256 = hex.EncodeToString(hasher.Sum(nil))
+		newAttachment.Status = models.AttachmentStatusPendingScan // 默认待扫描，后续可异步转 active
+
 	} else {
 		utils.Error(c, 1001, "不支持的 Content-Type")
 		return
@@ -91,6 +104,7 @@ func AddAttachment(c *gin.Context) {
 	})
 }
 
+// DownloadAttachment —— 统一网关下载：外链 302，本地文件直接返回
 func DownloadAttachment(c *gin.Context) {
 	attachmentID, _ := strconv.Atoi(c.Param("attachment_id"))
 
@@ -102,7 +116,13 @@ func DownloadAttachment(c *gin.Context) {
 
 	if attachment.Storage == models.StorageURL {
 		c.Redirect(302, attachment.URL)
-	} else {
-		c.File(attachment.ObjectKey)
+		return
 	}
+
+	// 本地/对象存储代理下载（示例直接读 ObjectKey）
+	if attachment.ObjectKey == "" {
+		utils.Error(c, 5000, "对象存储路径为空")
+		return
+	}
+	c.File(attachment.ObjectKey)
 }
