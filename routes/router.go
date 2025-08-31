@@ -5,11 +5,28 @@ import (
 	"ISCTF/controllers"
 	"ISCTF/middlewares"
 	"ISCTF/models"
+	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
+	"time"
 )
 
 func SetupRouter() *gin.Engine {
 	r := gin.Default()
+
+	r.Use(cors.New(cors.Config{
+		// 允许访问的源，这里直接指定你的前端开发服务器地址
+		AllowOrigins: []string{"http://localhost:5173"},
+		// 允许的请求方法
+		AllowMethods: []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		// 允许的请求头
+		AllowHeaders: []string{"Origin", "Content-Type", "Authorization"},
+		// 允许前端获取的响应头
+		ExposeHeaders: []string{"Content-Length"},
+		// 是否允许携带 cookie
+		AllowCredentials: true,
+		// preflight 请求的缓存时间
+		MaxAge: 12 * time.Hour,
+	}))
 
 	apiV1 := r.Group("/api/v1")
 	{

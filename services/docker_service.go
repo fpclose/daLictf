@@ -49,7 +49,7 @@ func encodeRegistryAuth(user, pass, server string) (string, error) {
 	ac := registrytypes.AuthConfig{
 		Username:      user,
 		Password:      pass,
-		ServerAddress: server, // 例如: https://registry.cn-hangzhou.aliyuncs.com
+		ServerAddress: server,
 	}
 	b, err := json.Marshal(ac)
 	if err != nil {
