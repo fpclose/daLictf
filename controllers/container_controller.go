@@ -74,22 +74,19 @@ func CreateContainer(c *gin.Context) {
 		}
 	}
 
-	dockerResp, err := services.CreateContainer(challenge, team, dynamicFlag)
+	// 调用新的 CreateService 函数，它会返回 Service ID
+	serviceID, err := services.CreateService(challenge, team, dynamicFlag)
 	if err != nil {
 		utils.Error(c, 5000, "Docker API Error: "+err.Error())
-		return
-	}
-	if err := services.StartContainer(dockerResp.ID); err != nil {
-		utils.Error(c, 5000, "Failed to start container: "+err.Error())
 		return
 	}
 
 	now := time.Now()
 	newContainer := models.Container{
-		DockerID:      dockerResp.ID,
+		DockerID:      serviceID, // 数据库中保存 Service ID
 		ChallengeID:   challenge.ID,
 		TeamID:        team.ID,
-		ContainerName: fmt.Sprintf("ctf_challenge_%d_%d", team.ID, challenge.ID),
+		ContainerName: fmt.Sprintf("ctf-service-%d-%d", team.ID, challenge.ID),
 		DockerImage:   challenge.DockerImage,
 		DockerPorts:   challenge.DockerPorts,
 		ContainerFlag: dynamicFlag,
@@ -98,25 +95,26 @@ func CreateContainer(c *gin.Context) {
 		EndTime:       now.Add(1 * time.Hour),
 	}
 	if err := database.DB.Create(&newContainer).Error; err != nil {
-		_ = services.DestroyContainer(dockerResp.ID)
+		_ = services.DestroyService(serviceID) // 如果数据库保存失败，则销毁服务
 		utils.Error(c, 5000, "Failed to save container record: "+err.Error())
 		return
 	}
 
-	containerInfo, err := services.GetContainerInfo(dockerResp.ID)
+	// 获取 Swarm 服务的端口信息
+	serviceInfo, _, err := services.GetServiceInfo(serviceID)
 	if err != nil {
-		log.Printf("Warning: failed to inspect container %s to get port mapping: %v", dockerResp.ID, err)
+		log.Printf("Warning: failed to inspect service %s to get port mapping: %v", serviceID, err)
 		utils.Error(c, 5000, "Container started but failed to get connection info.")
 		return
 	}
 
 	connectionInfo := make(map[string]string)
-	for containerPort, hostBindings := range containerInfo.NetworkSettings.Ports {
-		if len(hostBindings) > 0 {
-			hostIP := "127.0.0.1"
-			hostPort := hostBindings[0].HostPort
-			connectionInfo[containerPort.Port()] = fmt.Sprintf("%s:%s", hostIP, hostPort)
-		}
+	// =================================================================================
+	// [重要] 请将这里的 IP 地址替换为您的 Docker Swarm 集群任一节点的公网或内网 IP
+	// =================================================================================
+	swarmNodeIP := "127.0.0.1"
+	for _, port := range serviceInfo.Endpoint.Ports {
+		connectionInfo[strconv.Itoa(int(port.TargetPort))] = fmt.Sprintf("%s:%d", swarmNodeIP, port.PublishedPort)
 	}
 
 	utils.Success(c, "Container created successfully", gin.H{
@@ -162,8 +160,8 @@ func DestroyContainer(c *gin.Context) {
 
 	// 即使容器已停止或销毁，也尝试清理，并更新数据库状态
 	if container.State == models.ContainerStateRunning {
-		if err := services.DestroyContainer(container.DockerID); err != nil {
-			fmt.Printf("Warning: failed to destroy docker container %s: %v\n", container.DockerID, err)
+		if err := services.DestroyService(container.DockerID); err != nil {
+			fmt.Printf("Warning: failed to destroy docker service %s: %v\n", container.DockerID, err)
 		}
 	}
 
@@ -197,7 +195,7 @@ func ListContainers(c *gin.Context) {
 	var result []ContainerInfo
 	for i := range containers {
 		if containers[i].State == models.ContainerStateRunning {
-			if !services.IsContainerRunning(containers[i].DockerID) {
+			if !services.IsServiceRunning(containers[i].DockerID) {
 				containers[i].State = models.ContainerStateDestroyed
 				database.DB.Save(&containers[i])
 			}
@@ -295,9 +293,9 @@ func AdminDestroyContainer(c *gin.Context) {
 	}
 
 	if container.State == models.ContainerStateRunning {
-		if err := services.DestroyContainer(container.DockerID); err != nil {
+		if err := services.DestroyService(container.DockerID); err != nil {
 			// 记录警告，但不阻塞流程，因为容器可能已被手动删除
-			fmt.Printf("Warning: failed to destroy docker container %s by admin: %v\n", container.DockerID, err)
+			fmt.Printf("Warning: failed to destroy docker service %s by admin: %v\n", container.DockerID, err)
 		}
 	}
 

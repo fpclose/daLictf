@@ -7,6 +7,7 @@ import (
 	"ISCTF/models"
 	"ISCTF/services"
 	"ISCTF/utils"
+	"encoding/json"
 	"errors"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -15,6 +16,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // CreateChallenge —— 使用 DTO + 手动映射 + Normalize 兼容
@@ -116,6 +118,17 @@ func ListChallenges(c *gin.Context) {
 // GetChallengeDetail —— 用户可见的题目详情
 func GetChallengeDetail(c *gin.Context) {
 	id, _ := strconv.Atoi(c.Param("id"))
+	cacheKey := "challenge_detail:" + strconv.Itoa(id)
+
+	// 1. 尝试从 Redis 获取缓存
+	val, err := database.RDB.Get(database.Ctx, cacheKey).Result()
+	if err == nil {
+		var resp dto.ChallengeDetailResp
+		if json.Unmarshal([]byte(val), &resp) == nil {
+			utils.Success(c, "success (from cache)", resp)
+			return
+		}
+	}
 
 	var challenge models.Challenge
 	if err := database.DB.Preload("QuestionType").First(&challenge, id).Error; err != nil {
@@ -157,6 +170,12 @@ func GetChallengeDetail(c *gin.Context) {
 		Attachments:   mini,
 		CurrentScore:  challenge.CurrentScore,
 		SolvedCount:   challenge.SolvedCount,
+	}
+
+	// 2. 查询结果存入 Redis，缓存5分钟
+	jsonData, err := json.Marshal(resp)
+	if err == nil {
+		database.RDB.Set(database.Ctx, cacheKey, jsonData, 5*time.Minute)
 	}
 
 	utils.Success(c, "success", resp)
@@ -267,7 +286,7 @@ func SubmitFlag(c *gin.Context) {
 
 		if isCorrect && challenge.Mode == models.ChallengeModeDynamic && dynamicContainer.ID != 0 {
 			go func() {
-				err := services.DestroyContainer(dynamicContainer.DockerID)
+				err := services.DestroyService(dynamicContainer.DockerID) // 使用 DestroyService
 				if err != nil {
 					log.Printf("Error destroying container %s after solve: %v", dynamicContainer.DockerID, err)
 					return
@@ -307,6 +326,10 @@ func SubmitFlag(c *gin.Context) {
 	if err != nil && (err.Error() == "duplicate solve" || err.Error() == "incorrect flag") {
 		return
 	}
+
+	// 提交Flag后（无论成功失败），清理该题目的详情缓存，以保证分数和解题数能及时刷新
+	cacheKey := "challenge_detail:" + strconv.Itoa(challengeID)
+	database.RDB.Del(database.Ctx, cacheKey)
 }
 
 // UpdateChallenge —— 管理员修改题目
@@ -316,6 +339,10 @@ func UpdateChallenge(c *gin.Context) {
 		utils.Error(c, 1002, "无效的题目ID")
 		return
 	}
+
+	// 在执行更新前，先删除缓存
+	cacheKey := "challenge_detail:" + strconv.Itoa(id)
+	database.RDB.Del(database.Ctx, cacheKey)
 
 	var req dto.UpdateChallengeReq
 	if err := c.ShouldBindJSON(&req); err != nil {

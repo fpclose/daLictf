@@ -9,44 +9,42 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"strconv"
+	"strings"
 	"time"
 
-	"github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
 	imagetypes "github.com/docker/docker/api/types/image"
-	registrytypes "github.com/docker/docker/api/types/registry"
+	"github.com/docker/docker/api/types/registry"
+	"github.com/docker/docker/api/types/swarm"
 	"github.com/docker/docker/client"
-	"github.com/docker/go-connections/nat"
 )
 
 var DockerClient *client.Client
 
-// InitDocker 初始化 Docker 客户端
+// InitDocker 初始化 Docker 客户端并检查 Swarm 状态
 func InitDocker() {
 	var err error
 	DockerClient, err = client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		log.Fatalf("Failed to connect to Docker daemon: %v", err)
 	}
-	log.Println("Docker client initialized successfully.")
+
+	info, err := DockerClient.Info(context.Background())
+	if err != nil {
+		log.Fatalf("Failed to get Docker info: %v", err)
+	}
+
+	if info.Swarm.LocalNodeState != swarm.LocalNodeStateActive {
+		log.Fatalf("Docker is not running in Swarm mode. Please run 'docker swarm init'.")
+	}
+
+	log.Println("Docker client initialized and connected to Swarm cluster.")
 }
 
-// existsLocally 仅判断本地是否已有该镜像
-func existsLocally(ctx context.Context, ref string) (bool, error) {
-	_, _, err := DockerClient.ImageInspectWithRaw(ctx, ref)
-	if err == nil {
-		return true, nil
-	}
-	if errdefs.IsNotFound(err) {
-		return false, nil
-	}
-	return false, fmt.Errorf("inspect image %q: %w", ref, err)
-}
-
-// encodeRegistryAuth 生成私有仓库认证串；如果不用私有仓库，可以不调用本函数
+// encodeRegistryAuth 生成私有仓库认证串
 func encodeRegistryAuth(user, pass, server string) (string, error) {
-	ac := registrytypes.AuthConfig{
+	ac := registry.AuthConfig{
 		Username:      user,
 		Password:      pass,
 		ServerAddress: server,
@@ -58,93 +56,94 @@ func encodeRegistryAuth(user, pass, server string) (string, error) {
 	return base64.StdEncoding.EncodeToString(b), nil
 }
 
-// ensureImage 本地不存在时才去拉取，避免“远程没有但本地有却仍去拉远程”的问题
+// ensureImage 确保镜像在 Swarm 集群中可用
 func ensureImage(ctx context.Context, ref string, registryAuth string) error {
-	ok, err := existsLocally(ctx, ref)
-	if err != nil {
-		return err
-	}
-	if ok {
-		return nil // 本地已存在，跳过拉取
-	}
-
-	// 设置超时，避免网络问题卡死
 	pullCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 
 	rc, err := DockerClient.ImagePull(pullCtx, ref, imagetypes.PullOptions{
-		RegistryAuth: registryAuth, // 公有镜像留空；私有镜像传 encodeRegistryAuth 的结果
+		RegistryAuth: registryAuth,
 	})
 	if err != nil {
 		return fmt.Errorf("pull image %q: %w", ref, err)
 	}
+	defer rc.Close()
 	_, _ = io.Copy(io.Discard, rc)
-	_ = rc.Close()
 	return nil
 }
 
-// CreateContainer 创建容器（会自动确保镜像可用）
-func CreateContainer(challenge models.Challenge, team models.Team, flag string) (container.CreateResponse, error) {
+// CreateService 在 Docker Swarm 中创建一个服务来替代单个容器
+func CreateService(challenge models.Challenge, team models.Team, flag string) (string, error) {
 	ctx := context.Background()
-	containerName := fmt.Sprintf("ctf_challenge_%d_%d", team.ID, challenge.ID)
+	// 使用时间戳确保服务名唯一，避免冲突
+	serviceName := fmt.Sprintf("ctf-%d-%d-%d", team.ID, challenge.ID, time.Now().UnixNano())
 
-	// 1) 先确保镜像可用：本地有就用本地；没有再拉
-	var registryAuth string
-	// 私有仓库时放开下面一行并填写凭据
-	// registryAuth, _ = encodeRegistryAuth("USERNAME", "PASSWORD", "https://your-registry.example.com")
-	if err := ensureImage(ctx, challenge.DockerImage, registryAuth); err != nil {
-		return container.CreateResponse{}, fmt.Errorf("Docker API Error: %v", err)
-	}
+	// 确保镜像可用 (在生产环境中，建议提前在所有 Swarm Node 上拉取镜像)
+	// var registryAuth string
+	// if err := ensureImage(ctx, challenge.DockerImage, registryAuth); err != nil {
+	// 	return "", fmt.Errorf("ensure image failed: %v", err)
+	// }
 
-	// 2) 解析端口配置（形如 {"80":"tcp","3306":"tcp"}）
-	var ports map[string]string
-	exposedPorts := nat.PortSet{}
-	if err := json.Unmarshal([]byte(challenge.DockerPorts), &ports); err == nil {
-		for p, proto := range ports {
-			port, err := nat.NewPort(proto, p)
-			if err != nil {
-				log.Printf("Warning: Invalid port format '%s:%s' for challenge %d", proto, p, challenge.ID)
-				continue
-			}
-			exposedPorts[port] = struct{}{}
+	// 1. 解析端口配置，形如 "80,3306"
+	var portConfigs []swarm.PortConfig
+	ports := strings.Split(challenge.DockerPorts, ",")
+	for _, p := range ports {
+		port, err := strconv.ParseUint(strings.TrimSpace(p), 10, 32)
+		if err != nil {
+			log.Printf("Warning: Invalid port format '%s' for challenge %d", p, challenge.ID)
+			continue
 		}
+		portConfigs = append(portConfigs, swarm.PortConfig{
+			Protocol:    swarm.PortConfigProtocolTCP,
+			TargetPort:  uint32(port),
+			PublishMode: swarm.PortConfigPublishModeIngress, // 使用随机端口模式
+		})
 	}
 
-	// 3) 容器与主机配置
-	config := &container.Config{
-		Image:        challenge.DockerImage,
-		Env:          []string{"DALICTF_FLAG=" + flag}, // 若题目镜像读取的是 FLAG，这里改回 "FLAG="+flag
-		ExposedPorts: exposedPorts,
+	// 2. 定义服务规格 (ServiceSpec)
+	serviceSpec := swarm.ServiceSpec{
+		Annotations: swarm.Annotations{
+			Name: serviceName,
+		},
+		TaskTemplate: swarm.TaskSpec{
+			ContainerSpec: &swarm.ContainerSpec{
+				Image: challenge.DockerImage,
+				Env:   []string{"DALICTF_FLAG=" + flag},
+			},
+			Resources: &swarm.ResourceRequirements{
+				Limits: &swarm.Limit{
+					MemoryBytes: 256 * 1024 * 1024, // 限制内存 256MB
+					NanoCPUs:    500000000,         // 限制 CPU 0.5 Core
+				},
+			},
+		},
+		EndpointSpec: &swarm.EndpointSpec{
+			Ports: portConfigs,
+		},
 	}
-	hostConfig := &container.HostConfig{
-		AutoRemove:      true, // 容器退出后自动删除
-		PublishAllPorts: true, // 自动随机映射所有 ExposedPorts
-	}
 
-	// 4) 创建容器
-	return DockerClient.ContainerCreate(ctx, config, hostConfig, nil, nil, containerName)
-}
-
-// StartContainer 启动容器
-func StartContainer(containerID string) error {
-	return DockerClient.ContainerStart(context.Background(), containerID, container.StartOptions{})
-}
-
-// DestroyContainer 强制删除容器
-func DestroyContainer(containerID string) error {
-	return DockerClient.ContainerRemove(context.Background(), containerID, container.RemoveOptions{Force: true})
-}
-
-// GetContainerInfo 获取容器信息（含端口映射）
-func GetContainerInfo(containerID string) (types.ContainerJSON, error) {
-	return DockerClient.ContainerInspect(context.Background(), containerID)
-}
-
-// IsContainerRunning 判断容器是否在运行
-func IsContainerRunning(dockerID string) bool {
-	info, err := DockerClient.ContainerInspect(context.Background(), dockerID)
+	// 3. 创建服务
+	createOpts := types.ServiceCreateOptions{}
+	serviceResp, err := DockerClient.ServiceCreate(ctx, serviceSpec, createOpts)
 	if err != nil {
-		return false
+		return "", err
 	}
-	return info.State != nil && info.State.Running
+
+	return serviceResp.ID, nil
+}
+
+// DestroyService 销毁一个服务
+func DestroyService(serviceID string) error {
+	return DockerClient.ServiceRemove(context.Background(), serviceID)
+}
+
+// GetServiceInfo 获取服务信息
+func GetServiceInfo(serviceID string) (swarm.Service, []byte, error) {
+	return DockerClient.ServiceInspectWithRaw(context.Background(), serviceID, types.ServiceInspectOptions{})
+}
+
+// IsServiceRunning 检查服务是否仍在运行
+func IsServiceRunning(serviceID string) bool {
+	_, _, err := GetServiceInfo(serviceID)
+	return err == nil
 }

@@ -5,8 +5,11 @@ import (
 	"ISCTF/database"
 	"ISCTF/models"
 	"ISCTF/utils"
+	"encoding/json"
+	"fmt"
 	"github.com/gin-gonic/gin"
 	"strconv"
+	"time"
 )
 
 // GetScoreboard 查询排行榜
@@ -18,9 +21,27 @@ func GetScoreboard(c *gin.Context) {
 		limit = 10
 	}
 
+	// 1. 尝试从 Redis 获取缓存
+	cacheKey := fmt.Sprintf("scoreboard:%s:%d", track, limit)
+	val, err := database.RDB.Get(database.Ctx, cacheKey).Result()
+	if err == nil {
+		var results []models.Scoreboard
+		if json.Unmarshal([]byte(val), &results) == nil {
+			utils.Success(c, "success (from cache)", results)
+			return
+		}
+	}
+
 	var results []models.Scoreboard
 	// 修正：为保留字 rank 加上反引号
 	database.DB.Where("track = ?", track).Order("`rank` asc").Limit(limit).Find(&results)
+
+	// 2. 如果缓存未命中，则将数据库查询结果存入 Redis
+	jsonData, err := json.Marshal(results)
+	if err == nil {
+		// 将缓存有效期设置为较短的15秒，以保证排行榜的准实时性
+		database.RDB.Set(database.Ctx, cacheKey, jsonData, 15*time.Second)
+	}
 
 	utils.Success(c, "success", results)
 }

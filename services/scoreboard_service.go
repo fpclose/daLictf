@@ -80,6 +80,13 @@ func UpdateScoreboardCache() {
 		return nil
 	})
 
+	// 更新数据库后，清空所有与排行榜相关的 Redis 缓存，确保下次查询获取最新数据
+	keys, err := database.RDB.Keys(database.Ctx, "scoreboard:*").Result()
+	if err == nil && len(keys) > 0 {
+		database.RDB.Del(database.Ctx, keys...)
+		log.Printf("Cleared %d scoreboard cache keys from Redis.", len(keys))
+	}
+
 	log.Println("Scoreboard cache updated successfully.")
 }
 
